@@ -3,6 +3,7 @@ package goneo
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -93,7 +94,12 @@ func (p *Provider) doRequest(ctx context.Context, method, endpoint string, body 
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -112,8 +118,7 @@ func (p *Provider) doRequest(ctx context.Context, method, endpoint string, body 
 	return respBody, nil
 }
 
-// GetRecords lists all the records in the zone.
-func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+func (p *Provider) getGoneoRecords(ctx context.Context, zone string) ([]goneoRecord, error) {
 	domain := strings.TrimRight(zone, ".")
 	endpoint := fmt.Sprintf("/domains/%s/records", domain)
 	
@@ -128,19 +133,46 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, err
 	}
+	return result.Data, nil
+}
+
+// GetRecords lists all the records in the zone.
+func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+	gRecs, err := p.getGoneoRecords(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
 
 	var records []libdns.Record
-	for _, r := range result.Data {
+	for _, r := range gRecs {
+		data := r.Target
 		prio, _ := strconv.Atoi(r.Prio)
-		records = append(records, libdns.Record{
-			ID:       r.ID,
-			Type:     r.Type,
-			Name:     r.Name,
-			Value:    r.Target,
-			Priority: uint(prio),
+		if r.Type == "MX" || r.Type == "SRV" {
+			data = fmt.Sprintf("%d %s", prio, r.Target)
+		}
+
+		records = append(records, libdns.RR{
+			Type: r.Type,
+			Name: r.Name,
+			Data: data,
 		})
 	}
 	return records, nil
+}
+
+func parseDataForGoneo(rec libdns.RR) (string, int) {
+	content := rec.Data
+	prio := 0
+	if rec.Type == "MX" || rec.Type == "SRV" {
+		parts := strings.Fields(content)
+		if len(parts) >= 2 {
+			if p, err := strconv.Atoi(parts[0]); err == nil {
+				prio = p
+				content = strings.Join(parts[1:], " ")
+			}
+		}
+	}
+	return content, prio
 }
 
 // AppendRecords adds records to the zone. It returns the records that were added.
@@ -148,14 +180,16 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 	domain := strings.TrimRight(zone, ".")
 	var appended []libdns.Record
 
-	for _, rec := range records {
+	for _, rInterface := range records {
+		rec := rInterface.RR()
 		endpoint := fmt.Sprintf("/domains/%s/records", domain)
 		
+		content, prio := parseDataForGoneo(rec)
 		reqBody := map[string]interface{}{
 			"type":    rec.Type,
 			"name":    rec.Name,
-			"content": rec.Value,
-			"prio":    rec.Priority,
+			"content": content,
+			"prio":    prio,
 		}
 		
 		bodyBytes, err := json.Marshal(reqBody)
@@ -168,7 +202,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 			return appended, err
 		}
 		
-		appended = append(appended, rec)
+		appended = append(appended, rInterface)
 	}
 	return appended, nil
 }
@@ -178,23 +212,39 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 	domain := strings.TrimRight(zone, ".")
 	var setRecs []libdns.Record
 
-	for _, rec := range records {
-		if rec.ID != "" {
-			endpoint := fmt.Sprintf("/domains/%s/records/%s", domain, rec.ID)
+	gRecs, err := p.getGoneoRecords(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, rInterface := range records {
+		rec := rInterface.RR()
+		content, prio := parseDataForGoneo(rec)
+		
+		var matchID string
+		for _, gr := range gRecs {
+			if gr.Name == rec.Name && gr.Type == rec.Type {
+				matchID = gr.ID
+				break
+			}
+		}
+
+		if matchID != "" {
+			endpoint := fmt.Sprintf("/domains/%s/records/%s", domain, matchID)
 			reqBody := map[string]interface{}{
 				"type":    rec.Type,
 				"name":    rec.Name,
-				"content": rec.Value,
-				"prio":    rec.Priority,
+				"content": content,
+				"prio":    prio,
 			}
 			bodyBytes, _ := json.Marshal(reqBody)
 			_, err := p.doRequest(ctx, "PUT", endpoint, bodyBytes)
 			if err != nil {
 				return setRecs, err
 			}
-			setRecs = append(setRecs, rec)
+			setRecs = append(setRecs, rInterface)
 		} else {
-			appended, err := p.AppendRecords(ctx, zone, []libdns.Record{rec})
+			appended, err := p.AppendRecords(ctx, zone, []libdns.Record{rInterface})
 			if err != nil {
 				return setRecs, err
 			}
@@ -209,32 +259,33 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 	domain := strings.TrimRight(zone, ".")
 	var deleted []libdns.Record
 
-	for _, rec := range records {
-		id := rec.ID
-		if id == "" {
-			// Find ID by fetching records
-			allRecs, err := p.GetRecords(ctx, zone)
-			if err != nil {
-				return deleted, err
-			}
-			for _, r := range allRecs {
-				if r.Type == rec.Type && r.Name == rec.Name && r.Value == rec.Value {
-					id = r.ID
-					break
-				}
+	gRecs, err := p.getGoneoRecords(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, rInterface := range records {
+		rec := rInterface.RR()
+		content, _ := parseDataForGoneo(rec)
+		
+		var matchID string
+		for _, gr := range gRecs {
+			if gr.Type == rec.Type && gr.Name == rec.Name && gr.Target == content {
+				matchID = gr.ID
+				break
 			}
 		}
 
-		if id == "" {
-			continue // Already deleted or not found
+		if matchID == "" {
+			continue
 		}
 
-		endpoint := fmt.Sprintf("/domains/%s/records/%s", domain, id)
+		endpoint := fmt.Sprintf("/domains/%s/records/%s", domain, matchID)
 		_, err := p.doRequest(ctx, "DELETE", endpoint, nil)
 		if err != nil {
 			return deleted, err
 		}
-		deleted = append(deleted, rec)
+		deleted = append(deleted, rInterface)
 	}
 
 	return deleted, nil
